@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "NODE_OPTIONS=--experimental-sqlite next dev",
-    "build": "NODE_OPTIONS=--experimental-sqlite next build",
-    "start": "NODE_OPTIONS=--experimental-sqlite next start",
-    "db:reset": "rm -f data/xhn.sqlite data/xhn.sqlite-shm data/xhn.sqlite-wal"
+    "dev": "node scripts/run.mjs npx next dev",
+    "build": "node scripts/run.mjs npx next build",
+    "start": "node scripts/run.mjs npx next start",
+    "db:reset": "node scripts/reset-db.mjs"
   },
   "dependencies": {
     "next": "^15.5.6",

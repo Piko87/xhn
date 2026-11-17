@@ -9,7 +9,9 @@ npm install
 npm run dev
 ```
 
-浏览器打开 http://localhost:3000 。业务时间按 Asia/Shanghai 计算。
+Windows、macOS 和 Linux 都用上面的命令。浏览器打开 http://localhost:3000 。业务时间按 Asia/Shanghai 计算。
+
+座位在同一张画布上排布。分销库存模板在「演出管理 → 分销库存模板」，新建场次会套用该分区的默认模板。
 
 重置演示库：
 

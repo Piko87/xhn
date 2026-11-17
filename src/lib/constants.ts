@@ -32,6 +32,7 @@ export const NAV: { group: string; items: { href: string; label: string; module:
     items: [
       { href: "/venues", label: "场馆管理", module: "venues" },
       { href: "/sessions", label: "场次日历", module: "sessions" },
+      { href: "/inventory-templates", label: "分销库存模板", module: "inventory" },
       { href: "/inventory", label: "分销库存", module: "inventory" },
       { href: "/orders", label: "订单明细", module: "orders" },
     ],

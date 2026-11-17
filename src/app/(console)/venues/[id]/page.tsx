@@ -3,17 +3,16 @@ import { notFound } from "next/navigation";
 import { ActionForm } from "@/components/action-form";
 import { can } from "@/lib/auth";
 import { requireAccess } from "@/lib/guard";
-import { getVenue, listChannels } from "@/lib/queries";
-import { deleteZone, saveDefaultHold, saveVenue, saveZone } from "@/server/show-actions";
+import { getVenue, listTemplates } from "@/lib/queries";
+import { deleteZone, saveVenue, saveZone } from "@/server/show-actions";
 
 export default async function VenueDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const user = await requireAccess("venues", "read");
   const editable = can(user.access, "venues", "write");
-  const inventory = can(user.access, "inventory", "write");
   const { id } = await params;
   const venue = getVenue(Number(id));
   if (!venue) notFound();
-  const channels = listChannels().filter((channel) => channel.kind === "分销");
+  const templates = listTemplates(venue.id);
   return (
     <div>
       <header className="page-head">
@@ -23,6 +22,7 @@ export default async function VenueDetailPage({ params }: { params: Promise<{ id
         </div>
         <div className="actions">
           <Link className="btn" href={`/venues/${venue.id}/seats`}>打开座位图</Link>
+          <Link className="btn" href={`/inventory-templates?venue=${venue.id}`}>分销库存模板</Link>
           <Link className="btn" href={`/sessions?venue=${venue.id}`}>场次日历</Link>
         </div>
       </header>
@@ -55,24 +55,10 @@ export default async function VenueDetailPage({ params }: { params: Promise<{ id
                 <input type="hidden" name="venue_id" value={venue.id} />
                 <label className="field"><span>名称</span><input name="name" defaultValue={zone.name} disabled={!editable} /></label>
                 <label className="field"><span>颜色</span><input name="color" defaultValue={zone.color} disabled={!editable} /></label>
-                <label className="field"><span>默认预留</span><input name="reserved" type="number" defaultValue={zone.reserved} disabled={!editable} /></label>
                 {editable ? <button className="btn" type="submit">保存分区</button> : null}
               </ActionForm>
-              <p className="hint">编号 {zone.numbering} · {zone.rows_n} 排 × {zone.cols_n} 座。默认预留会套用到新建场次。</p>
-              {inventory ? (
-                <ActionForm action={saveDefaultHold} className="grid-3">
-                  <input type="hidden" name="venue_id" value={venue.id} />
-                  <input type="hidden" name="zone_id" value={zone.id} />
-                  <label className="field"><span>默认独立渠道</span>
-                    <select name="channel_id" defaultValue={channels[0]?.id}>
-                      {channels.map((channel) => <option key={channel.id} value={channel.id}>{channel.name}</option>)}
-                    </select>
-                  </label>
-                  <label className="field"><span>数量（0 为取消）</span><input name="qty" type="number" defaultValue={0} /></label>
-                  <button className="btn" type="submit">写入默认分配</button>
-                </ActionForm>
-              ) : null}
-              <p className="note">已有默认独立库存：{venue.holds.filter((hold) => hold.zone_id === zone.id).map((hold) => `${hold.channel_name} ${hold.qty}`).join("、") || "无"}</p>
+              <p className="hint">编号 {zone.numbering}。预留和独立库存在分销库存模板里设置，新建场次会套用默认模板。</p>
+              <p className="note">默认模板：{templates.filter((item) => item.zone_id === zone.id && item.is_default).map((item) => item.name).join("、") || "未设置"} · <Link href={`/inventory-templates?venue=${venue.id}&zone=${zone.id}`}>去模板</Link></p>
               {editable ? (
                 <ActionForm action={deleteZone}>
                   <input type="hidden" name="id" value={zone.id} />

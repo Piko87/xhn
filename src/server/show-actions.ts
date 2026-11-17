@@ -7,11 +7,17 @@ import { can } from "@/lib/auth";
 import { applyVenueDefaults, getDb } from "@/lib/db";
 import { requireAccess } from "@/lib/guard";
 import { nextCode, qall, qget } from "@/lib/queries";
-import { seatSequence } from "@/lib/seats";
+import { numberCells, seatSequence } from "@/lib/seats";
+import { shanghaiNow } from "@/lib/time";
 import type { ActionState, ZoneAllocationInput } from "@/lib/types";
 
 function text(formData: FormData, key: string) {
   return String(formData.get(key) || "").trim();
+}
+
+function stamp() {
+  const now = shanghaiNow();
+  return `${now.date} ${now.time}`;
 }
 
 export async function saveVenue(_prev: ActionState, formData: FormData): Promise<ActionState> {
@@ -70,7 +76,7 @@ export async function saveZone(_prev: ActionState, formData: FormData): Promise<
      ON CONFLICT(venue_id, zone_id) DO UPDATE SET reserved=excluded.reserved`,
   ).run(venueId, zoneId, reserved);
   revalidatePath(`/venues/${venueId}`);
-  return { ok: true, message: id ? "分区已保存" : "分区已添加。请到座位图按模板生成座位。" };
+  return { ok: true, message: id ? "分区已保存" : "分区已添加。到座位图里用划选把格子划进这个分区。" };
 }
 
 export async function deleteZone(_prev: ActionState, formData: FormData): Promise<ActionState> {
@@ -83,6 +89,12 @@ export async function deleteZone(_prev: ActionState, formData: FormData): Promis
   db.prepare("DELETE FROM seats WHERE zone_id = ?").run(id);
   db.prepare("DELETE FROM inventory_default_holds WHERE zone_id = ?").run(id);
   db.prepare("DELETE FROM inventory_defaults WHERE zone_id = ?").run(id);
+  const templates = qall<{ id: number }>("SELECT id FROM inventory_templates WHERE zone_id = ?", id);
+  for (const template of templates) {
+    db.prepare("DELETE FROM template_channel_holds WHERE template_id = ?").run(template.id);
+    db.prepare("DELETE FROM template_group_holds WHERE template_id = ?").run(template.id);
+  }
+  db.prepare("DELETE FROM inventory_templates WHERE zone_id = ?").run(id);
   db.prepare("DELETE FROM zones WHERE id = ?").run(id);
   revalidatePath(`/venues/${venueId}`);
   return { ok: true, message: "分区已删除" };
@@ -132,16 +144,18 @@ export async function copyVenue(formData: FormData) {
       .run(nextId, zone.name, zone.color, zone.rows_n, zone.cols_n, zone.numbering, zone.sort_order);
     map.set(zone.id, Number(created.lastInsertRowid));
   }
-  const seats = qall<{ zone_id: number; row_no: number; col_no: number; row_label: string; seat_no: number; sellable: number }>(
+  const seats = qall<{ zone_id: number | null; row_no: number; col_no: number; row_label: string; seat_no: number; sellable: number; kind: string }>(
     "SELECT * FROM seats WHERE venue_id = ?",
     venueId,
   );
   const insertSeat = db.prepare(
-    "INSERT INTO seats (venue_id, zone_id, row_no, col_no, row_label, seat_no, sellable) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO seats (venue_id, zone_id, row_no, col_no, row_label, seat_no, sellable, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
   );
   for (const seat of seats) {
-    insertSeat.run(nextId, map.get(seat.zone_id) ?? 0, seat.row_no, seat.col_no, seat.row_label, seat.seat_no, seat.sellable);
+    insertSeat.run(nextId, seat.zone_id ? map.get(seat.zone_id) ?? null : null, seat.row_no, seat.col_no, seat.row_label, seat.seat_no, seat.sellable, seat.kind || "seat");
   }
+  const source = qget<{ grid_rows: number; grid_cols: number }>("SELECT grid_rows, grid_cols FROM venues WHERE id = ?", venueId);
+  if (source) db.prepare("UPDATE venues SET grid_rows = ?, grid_cols = ? WHERE id = ?").run(source.grid_rows, source.grid_cols, nextId);
   const defaults = qall<{ zone_id: number; reserved: number }>("SELECT zone_id, reserved FROM inventory_defaults WHERE venue_id = ?", venueId);
   for (const item of defaults) {
     db.prepare("INSERT INTO inventory_defaults (venue_id, zone_id, reserved) VALUES (?, ?, ?)").run(nextId, map.get(item.zone_id) ?? 0, item.reserved);
@@ -179,13 +193,47 @@ export async function deleteVenue(_prev: ActionState, formData: FormData): Promi
   return { ok: true, message: "场馆已删除" };
 }
 
-export async function saveSeats(input: { venueId: number; seats: { id: number; zoneId: number; sellable: number }[] }): Promise<ActionState> {
-  await requireAccess("seatmaps", "write");
+export async function saveSeats(input: {
+  venueId: number;
+  rows: number;
+  cols: number;
+  zones: { id: number; numbering: Numbering }[];
+  cells: { row: number; col: number; kind: "seat" | "aisle"; zoneId: number | null; sellable: number }[];
+}): Promise<ActionState> {
+  const user = await requireAccess("seatmaps", "write");
+  if (input.rows < 1 || input.cols < 1 || input.rows > 40 || input.cols > 60) return { ok: false, message: "行数 1–40，列数 1–60" };
   const db = getDb();
-  const update = db.prepare("UPDATE seats SET zone_id = ?, sellable = ? WHERE id = ? AND venue_id = ?");
+  const numbers = numberCells(
+    input.cells.map((cell) => ({ row: cell.row, col: cell.col, kind: cell.kind, zoneId: cell.zoneId })),
+    input.zones,
+  );
   db.exec("BEGIN");
   try {
-    for (const seat of input.seats) update.run(seat.zoneId, seat.sellable ? 1 : 0, seat.id, input.venueId);
+    for (const zone of input.zones) db.prepare("UPDATE zones SET numbering = ? WHERE id = ? AND venue_id = ?").run(zone.numbering, zone.id, input.venueId);
+    db.prepare("UPDATE venues SET grid_rows = ?, grid_cols = ? WHERE id = ?").run(input.rows, input.cols, input.venueId);
+    db.prepare("DELETE FROM seats WHERE venue_id = ?").run(input.venueId);
+    const insert = db.prepare(
+      "INSERT INTO seats (venue_id, zone_id, row_no, col_no, row_label, seat_no, sellable, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    for (const cell of input.cells) {
+      if (cell.row < 1 || cell.row > input.rows || cell.col < 0 || cell.col >= input.cols) continue;
+      insert.run(
+        input.venueId,
+        cell.kind === "seat" ? cell.zoneId : null,
+        cell.row,
+        cell.col,
+        `${cell.row}排`,
+        cell.kind === "seat" ? numbers.get(`${cell.row}:${cell.col}`) ?? 0 : 0,
+        cell.kind === "seat" && cell.sellable ? 1 : 0,
+        cell.kind,
+      );
+    }
+    db.prepare("INSERT INTO operation_logs (area, target, actor, summary, created_at) VALUES ('座位图', ?, ?, ?, ?)").run(
+      String(input.venueId),
+      user.name,
+      `保存 ${input.rows} 行 × ${input.cols} 列座位图`,
+      stamp(),
+    );
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
@@ -193,7 +241,7 @@ export async function saveSeats(input: { venueId: number; seats: { id: number; z
   }
   revalidatePath(`/venues/${input.venueId}/seats`);
   revalidatePath("/inventory");
-  return { ok: true, message: "座位图已保存" };
+  return { ok: true, message: "座位图已保存。过道不占库存，不可售座位不进入分销池。" };
 }
 
 export async function regenerateZone(_prev: ActionState, formData: FormData): Promise<ActionState> {
@@ -272,6 +320,7 @@ export async function deleteSession(_prev: ActionState, formData: FormData): Pro
   if (used) return { ok: false, message: "场次已有订单，不能删除" };
   const db = getDb();
   db.prepare("DELETE FROM session_holds WHERE session_id = ?").run(id);
+  db.prepare("DELETE FROM session_group_holds WHERE session_id = ?").run(id);
   db.prepare("DELETE FROM session_zones WHERE session_id = ?").run(id);
   db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
   revalidatePath("/sessions");
@@ -285,7 +334,7 @@ export async function saveAllocation(input: { sessionId: number; zones: ZoneAllo
   if (!session) return { ok: false, message: "场次不存在" };
   const db = getDb();
   for (const zone of input.zones) {
-    const cap = qget<{ n: number }>("SELECT COUNT(*) AS n FROM seats WHERE zone_id = ? AND sellable = 1", zone.zoneId);
+    const cap = qget<{ n: number }>("SELECT COUNT(*) AS n FROM seats WHERE zone_id = ? AND kind = 'seat' AND sellable = 1", zone.zoneId);
     const capacity = cap?.n ?? 0;
     const exclusive = zone.holds.reduce((sum, hold) => sum + Math.max(0, hold.qty), 0);
     if (zone.reserved < 0 || exclusive < 0) return { ok: false, message: "库存不能为负数" };

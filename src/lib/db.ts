@@ -3,10 +3,10 @@ import fs from "fs";
 import path from "path";
 import { MODULES, type Access, type Numbering } from "./constants";
 import { hashPassword } from "./password";
-import { seatLabel, seatSequence } from "./seats";
+import { numberCells, seatLabel, type CellKind } from "./seats";
 import { addDays, weekdayOf } from "./time";
 
-const SCHEMA_VERSION = "1";
+const SCHEMA_VERSION = "2";
 
 const globalForDb = globalThis as unknown as { xhnDb?: DatabaseSync };
 
@@ -27,7 +27,23 @@ export function getDb() {
   return globalForDb.xhnDb;
 }
 
+function readSchemaVersion(db: DatabaseSync) {
+  const meta = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get();
+  if (!meta) return null;
+  const row = db.prepare("SELECT value FROM meta WHERE key = 'schema'").get() as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+function dropAllTables(db: DatabaseSync) {
+  db.exec("PRAGMA foreign_keys = OFF");
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
+  for (const table of tables) db.exec(`DROP TABLE IF EXISTS "${table.name}"`);
+  db.exec("PRAGMA foreign_keys = ON");
+}
+
 function migrate(db: DatabaseSync) {
+  const existing = readSchemaVersion(db);
+  if (existing && existing !== SCHEMA_VERSION) dropAllTables(db);
   db.exec(`
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS roles (
@@ -70,7 +86,9 @@ function migrate(db: DatabaseSync) {
       map_note TEXT NOT NULL DEFAULT '',
       display_mode TEXT NOT NULL DEFAULT 'fuzzy',
       fuzzy_ample INTEGER NOT NULL DEFAULT 40,
-      fuzzy_tight INTEGER NOT NULL DEFAULT 15
+      fuzzy_tight INTEGER NOT NULL DEFAULT 15,
+      grid_rows INTEGER NOT NULL DEFAULT 12,
+      grid_cols INTEGER NOT NULL DEFAULT 16
     );
     CREATE TABLE IF NOT EXISTS zones (
       id INTEGER PRIMARY KEY,
@@ -85,12 +103,13 @@ function migrate(db: DatabaseSync) {
     CREATE TABLE IF NOT EXISTS seats (
       id INTEGER PRIMARY KEY,
       venue_id INTEGER NOT NULL,
-      zone_id INTEGER NOT NULL,
+      zone_id INTEGER,
       row_no INTEGER NOT NULL,
       col_no INTEGER NOT NULL,
       row_label TEXT NOT NULL,
       seat_no INTEGER NOT NULL,
-      sellable INTEGER NOT NULL DEFAULT 1
+      sellable INTEGER NOT NULL DEFAULT 1,
+      kind TEXT NOT NULL DEFAULT 'seat'
     );
     CREATE TABLE IF NOT EXISTS products (
       id INTEGER PRIMARY KEY,
@@ -250,7 +269,53 @@ function migrate(db: DatabaseSync) {
       session_id INTEGER NOT NULL,
       zone_id INTEGER NOT NULL,
       reserved INTEGER NOT NULL,
+      template_name TEXT NOT NULL DEFAULT '',
       PRIMARY KEY (session_id, zone_id)
+    );
+    CREATE TABLE IF NOT EXISTS dist_groups (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS dist_group_channels (
+      group_id INTEGER NOT NULL,
+      channel_id INTEGER NOT NULL,
+      PRIMARY KEY (group_id, channel_id)
+    );
+    CREATE TABLE IF NOT EXISTS inventory_templates (
+      id INTEGER PRIMARY KEY,
+      venue_id INTEGER NOT NULL,
+      zone_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      reserved INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS template_channel_holds (
+      template_id INTEGER NOT NULL,
+      channel_id INTEGER NOT NULL,
+      qty INTEGER NOT NULL,
+      PRIMARY KEY (template_id, channel_id)
+    );
+    CREATE TABLE IF NOT EXISTS template_group_holds (
+      template_id INTEGER NOT NULL,
+      group_id INTEGER NOT NULL,
+      qty INTEGER NOT NULL,
+      PRIMARY KEY (template_id, group_id)
+    );
+    CREATE TABLE IF NOT EXISTS session_group_holds (
+      session_id INTEGER NOT NULL,
+      zone_id INTEGER NOT NULL,
+      group_id INTEGER NOT NULL,
+      qty INTEGER NOT NULL,
+      PRIMARY KEY (session_id, zone_id, group_id)
+    );
+    CREATE TABLE IF NOT EXISTS operation_logs (
+      id INTEGER PRIMARY KEY,
+      area TEXT NOT NULL,
+      target TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS session_holds (
       session_id INTEGER NOT NULL,
@@ -422,24 +487,27 @@ function insertTicket(db: DatabaseSync, code: string, productId: number, name: s
   db.prepare(`INSERT INTO tickets (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`).run(...values);
 }
 
-function fillZone(
+function paintCanvas(
   db: DatabaseSync,
   venueId: number,
-  zoneId: number,
   rows: number,
   cols: number,
-  mode: Numbering,
-  unsellable?: (row: number, col: number) => boolean,
+  cells: { row: number; col: number; zoneId: number | null; kind: CellKind; sellable?: number }[],
+  zones: { id: number; numbering: Numbering }[],
 ) {
-  const sequence = seatSequence(cols, mode);
-  const insert = db.prepare(
-    `INSERT INTO seats (venue_id, zone_id, row_no, col_no, row_label, seat_no, sellable)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  db.prepare("UPDATE venues SET grid_rows = ?, grid_cols = ? WHERE id = ?").run(rows, cols, venueId);
+  const numbers = numberCells(
+    cells.map((cell) => ({ row: cell.row, col: cell.col, kind: cell.kind, zoneId: cell.zoneId })),
+    zones,
   );
-  for (let row = 1; row <= rows; row += 1) {
-    for (let col = 0; col < cols; col += 1) {
-      insert.run(venueId, zoneId, row, col, `${row}排`, sequence[col], unsellable?.(row, col) ? 0 : 1);
-    }
+  const insert = db.prepare(
+    `INSERT INTO seats (venue_id, zone_id, row_no, col_no, row_label, seat_no, sellable, kind)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const cell of cells) {
+    if (cell.kind === "empty") continue;
+    const sellable = cell.kind === "seat" && cell.sellable !== 0 ? 1 : 0;
+    insert.run(venueId, cell.zoneId, cell.row, cell.col, `${cell.row}排`, numbers.get(`${cell.row}:${cell.col}`) ?? 0, sellable, cell.kind);
   }
 }
 
@@ -449,21 +517,27 @@ function grant(db: DatabaseSync, roleId: number, access: Partial<Record<string, 
 }
 
 function copyDefaults(db: DatabaseSync, sessionId: number, venueId: number) {
-  const zones = db.prepare("SELECT zone_id, reserved FROM inventory_defaults WHERE venue_id = ?").all(venueId) as {
-    zone_id: number;
-    reserved: number;
-  }[];
-  const zoneInsert = db.prepare("INSERT INTO session_zones (session_id, zone_id, reserved) VALUES (?, ?, ?)");
-  for (const zone of zones) zoneInsert.run(sessionId, zone.zone_id, zone.reserved);
-  const holds = db.prepare("SELECT zone_id, channel_id, qty FROM inventory_default_holds WHERE venue_id = ?").all(venueId) as {
-    zone_id: number;
-    channel_id: number;
-    qty: number;
-  }[];
-  const holdInsert = db.prepare(
-    "INSERT INTO session_holds (session_id, zone_id, channel_id, qty) VALUES (?, ?, ?, ?)",
-  );
-  for (const hold of holds) holdInsert.run(sessionId, hold.zone_id, hold.channel_id, hold.qty);
+  const zones = db.prepare("SELECT id FROM zones WHERE venue_id = ?").all(venueId) as { id: number }[];
+  const zoneInsert = db.prepare("INSERT INTO session_zones (session_id, zone_id, reserved, template_name) VALUES (?, ?, ?, ?)");
+  const channelInsert = db.prepare("INSERT INTO session_holds (session_id, zone_id, channel_id, qty) VALUES (?, ?, ?, ?)");
+  const groupInsert = db.prepare("INSERT INTO session_group_holds (session_id, zone_id, group_id, qty) VALUES (?, ?, ?, ?)");
+  for (const zone of zones) {
+    const template = db
+      .prepare("SELECT id, name, reserved FROM inventory_templates WHERE venue_id = ? AND zone_id = ? AND is_default = 1")
+      .get(venueId, zone.id) as { id: number; name: string; reserved: number } | undefined;
+    zoneInsert.run(sessionId, zone.id, template?.reserved ?? 0, template?.name ?? "");
+    if (!template) continue;
+    const channels = db.prepare("SELECT channel_id, qty FROM template_channel_holds WHERE template_id = ?").all(template.id) as {
+      channel_id: number;
+      qty: number;
+    }[];
+    for (const hold of channels) channelInsert.run(sessionId, zone.id, hold.channel_id, hold.qty);
+    const groups = db.prepare("SELECT group_id, qty FROM template_group_holds WHERE template_id = ?").all(template.id) as {
+      group_id: number;
+      qty: number;
+    }[];
+    for (const hold of groups) groupInsert.run(sessionId, zone.id, hold.group_id, hold.qty);
+  }
 }
 
 export function applyVenueDefaults(sessionId: number, venueId: number) {
@@ -549,27 +623,71 @@ function seed(db: DatabaseSync) {
     );
     zone.run(1, "池座", "#c4552a", 8, 10, "正序", 1);
     zone.run(1, "楼座", "#1f6f64", 4, 12, "倒序", 2);
-    zone.run(1, "侧厢", "#b0893e", 2, 8, "奇数在左", 3);
+    zone.run(1, "侧厢", "#b0893e", 4, 4, "奇数在左", 3);
     zone.run(2, "观众席", "#3d4f7c", 5, 8, "正序", 1);
     zone.run(2, "阶梯后区", "#6b4c7a", 3, 8, "倒序", 2);
 
-    fillZone(db, 1, 1, 8, 10, "正序");
-    fillZone(db, 1, 2, 4, 12, "倒序");
-    fillZone(db, 1, 3, 2, 8, "奇数在左");
-    fillZone(db, 2, 4, 5, 8, "正序");
-    fillZone(db, 2, 5, 3, 8, "倒序");
+    const mirror: { row: number; col: number; zoneId: number | null; kind: CellKind; sellable?: number }[] = [];
+    const aisle = (row: number, col: number) => mirror.push({ row, col, zoneId: null, kind: "aisle" });
+    const seat = (row: number, col: number, zoneId: number, sellable = 1) => mirror.push({ row, col, zoneId, kind: "seat", sellable });
+    for (let row = 1; row <= 8; row += 1) {
+      aisle(row, 3);
+      aisle(row, 14);
+      for (let col = 4; col <= 13; col += 1) seat(row, col, 1);
+    }
+    seat(1, 2, 1, 0);
+    seat(1, 15, 1, 0);
+    for (let row = 2; row <= 5; row += 1) {
+      seat(row, 0, 3);
+      seat(row, 1, 3);
+      seat(row, 16, 3);
+      seat(row, 17, 3);
+    }
+    for (let col = 0; col <= 17; col += 1) aisle(9, col);
+    for (let row = 10; row <= 13; row += 1) {
+      aisle(row, 8);
+      for (let col = 2; col <= 7; col += 1) seat(row, col, 2);
+      for (let col = 9; col <= 14; col += 1) seat(row, col, 2);
+    }
+    paintCanvas(db, 1, 13, 18, mirror, [
+      { id: 1, numbering: "正序" },
+      { id: 2, numbering: "倒序" },
+      { id: 3, numbering: "奇数在左" },
+    ]);
 
+    const small: { row: number; col: number; zoneId: number | null; kind: CellKind; sellable?: number }[] = [];
+    for (let row = 1; row <= 5; row += 1) {
+      small.push({ row, col: 0, zoneId: null, kind: "aisle" });
+      small.push({ row, col: 9, zoneId: null, kind: "aisle" });
+      for (let col = 1; col <= 8; col += 1) small.push({ row, col, zoneId: 4, kind: "seat", sellable: 1 });
+    }
+    for (let col = 0; col <= 9; col += 1) small.push({ row: 6, col, zoneId: null, kind: "aisle" });
+    for (let row = 7; row <= 9; row += 1) {
+      for (let col = 1; col <= 8; col += 1) small.push({ row, col, zoneId: 5, kind: "seat", sellable: 1 });
+    }
+    paintCanvas(db, 2, 9, 10, small, [
+      { id: 4, numbering: "正序" },
+      { id: 5, numbering: "倒序" },
+    ]);
+
+    db.prepare("INSERT INTO dist_groups (name) VALUES (?)").run("镜厅协议");
+    db.prepare("INSERT INTO dist_group_channels (group_id, channel_id) VALUES (1, 6)").run();
+    const template = db.prepare(
+      "INSERT INTO inventory_templates (venue_id, zone_id, name, is_default, reserved, created_at) VALUES (?, ?, ?, 1, ?, '2026-10-20 09:30')",
+    );
+    template.run(1, 1, "镜厅池座默认", 8);
+    template.run(1, 2, "镜厅楼座默认", 4);
+    template.run(1, 3, "镜厅侧厢默认", 2);
+    template.run(2, 4, "小剧场观众席默认", 0);
+    template.run(2, 5, "小剧场后区默认", 0);
+    db.prepare("INSERT INTO template_group_holds (template_id, group_id, qty) VALUES (1, 1, 16)").run();
+    db.prepare("INSERT INTO template_group_holds (template_id, group_id, qty) VALUES (3, 1, 4)").run();
     const reserve = db.prepare("INSERT INTO inventory_defaults (venue_id, zone_id, reserved) VALUES (?, ?, ?)");
     reserve.run(1, 1, 8);
     reserve.run(1, 2, 4);
     reserve.run(1, 3, 2);
     reserve.run(2, 4, 0);
     reserve.run(2, 5, 0);
-    const hold = db.prepare(
-      "INSERT INTO inventory_default_holds (venue_id, zone_id, channel_id, qty) VALUES (?, ?, ?, ?)",
-    );
-    hold.run(1, 1, 6, 16);
-    hold.run(1, 3, 6, 4);
 
     const product = db.prepare(
       `INSERT INTO products (
@@ -817,7 +935,7 @@ function seed(db: DatabaseSync) {
           zoneId,
           db
             .prepare(
-              "SELECT row_label, seat_no FROM seats WHERE zone_id = ? AND sellable = 1 ORDER BY row_no, col_no",
+              "SELECT row_label, seat_no FROM seats WHERE zone_id = ? AND kind = 'seat' AND sellable = 1 ORDER BY row_no, col_no",
             )
             .all(zoneId) as { row_label: string; seat_no: number }[],
         );

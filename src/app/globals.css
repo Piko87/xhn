@@ -223,6 +223,14 @@ textarea { min-height: 84px; resize: vertical; }
   font-weight: 700;
 }
 .seat.off { background: repeating-linear-gradient(135deg, #f3ecdf, #f3ecdf 4px, #e6dccb 4px, #e6dccb 8px) !important; color: #8d7d6c; }
+.seat.blank { background: transparent; border: 1px dashed #e4d8c8; color: transparent; }
+.seat.aisle { background: #efe6da; border-radius: 3px; }
+.seat.picked { outline: 2px solid #241910; }
+.canvas { overflow: auto; padding-top: 8px; }
+.bar-stack { display: flex; height: 16px; border-radius: 99px; overflow: hidden; background: #efe6da; }
+.bar-stack i { display: block; height: 100%; }
+.modal-back { position: fixed; inset: 0; background: rgba(36, 25, 16, .45); display: flex; align-items: center; justify-content: center; z-index: 30; }
+.modal { width: min(460px, 92vw); background: var(--panel); border-radius: 14px; padding: 18px; box-shadow: var(--shadow); }
 .login { min-height: 100vh; display: grid; grid-template-columns: 1.15fr .85fr; }
 .login-hero {
   padding: 72px 64px;

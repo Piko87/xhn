@@ -1,13 +1,14 @@
 import Link from "next/link";
 import { ActionForm } from "@/components/action-form";
-import { InventoryBoard } from "@/components/inventory-board";
+import { AllocationPanel } from "@/components/allocation-panel";
 import { can } from "@/lib/auth";
+import { isOccupying } from "@/lib/inventory";
 import { requireAccess } from "@/lib/guard";
-import { getSession, listChannels, plain, qall, qget } from "@/lib/queries";
+import { getSession, listChannels, listGroups, listLogs, listVenues, qall, qget, sessionOrders } from "@/lib/queries";
 import { advanceText } from "@/lib/sale-rules";
 import { deleteSession, saveSession } from "@/server/show-actions";
 
-export default async function InventoryPage({ searchParams }: { searchParams: Promise<{ session?: string }> }) {
+export default async function InventoryPage({ searchParams }: { searchParams: Promise<{ session?: string; venue?: string; zone?: string; date?: string }> }) {
   const user = await requireAccess("inventory", "read");
   const editable = can(user.access, "inventory", "write");
   const windowEditable = can(user.access, "sale_windows", "write");
@@ -41,13 +42,23 @@ export default async function InventoryPage({ searchParams }: { searchParams: Pr
         </div>
       </header>
       <form className="filters" action="/inventory">
+        <label className="field"><span>场馆</span>
+          <select name="venue" defaultValue={session.venue_id}>{listVenues().map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+        </label>
+        <label className="field"><span>日期</span><input type="date" name="date" defaultValue={session.session_date} /></label>
         <label className="field"><span>场次</span>
           <select name="session" defaultValue={session.id}>
             {sessions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
           </select>
         </label>
+        <label className="field"><span>分区</span>
+          <select name="zone" defaultValue={sp.zone || zones[0]?.id}>
+            {zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}
+          </select>
+        </label>
         <button className="btn" type="submit">打开</button>
         <Link className="btn" href={`/sessions?venue=${session.venue_id}&date=${session.session_date}`}>返回日历</Link>
+        <Link className="btn" href={`/inventory-templates?venue=${session.venue_id}`}>模板</Link>
       </form>
       <section className="card" style={{ marginBottom: 14 }}>
         <h2>开售窗口</h2>
@@ -89,26 +100,56 @@ export default async function InventoryPage({ searchParams }: { searchParams: Pr
           </ActionForm>
         ) : null}
       </section>
-      <InventoryBoard
-        sessionId={session.id}
-        editable={editable}
-        channels={plain(listChannels())}
-        venue={{ display_mode: session.display_mode, fuzzy_ample: session.fuzzy_ample, fuzzy_tight: session.fuzzy_tight }}
-        zones={zones.map((zone) => ({
-          id: zone.id,
-          name: zone.name,
-          color: zone.color,
-          capacity: zone.capacity,
-          unsellable: zone.unsellable,
-          reserved: zone.reserved,
-          holds: zone.holds,
-          sharedPool: zone.sharedPool,
-          sharedSold: zone.sharedSold,
-          sharedRemaining: zone.sharedRemaining,
-          available: zone.available,
-          sold: zone.sold,
-        }))}
-      />
+      {zones.filter((zone) => !sp.zone || String(zone.id) === sp.zone).map((zone) => {
+        const channels = listChannels();
+        const groups = listGroups();
+        const orders = sessionOrders(session.id).filter((order) => order.zone_id === zone.id && isOccupying(order.status));
+        const soldOf = (ids: number[]) => orders.filter((order) => ids.includes(order.channel_id)).reduce((sum, order) => sum + order.qty, 0);
+        const grouped = new Set(groups.flatMap((group) => group.channelIds));
+        const rows = [
+          { key: "reserved", label: "预留", target: "reserved" as const, targetId: 0, mode: "预留" as const, qty: zone.reserved, sold: 0, available: zone.reserved },
+          ...channels.filter((channel) => channel.kind === "直销").map((channel) => {
+            const hold = zone.holds.find((item) => item.channelId === channel.id);
+            const sold = soldOf([channel.id]);
+            return { key: `c${channel.id}`, label: `直销 · ${channel.name}`, target: "channel" as const, targetId: channel.id, mode: hold ? "独立" as const : "共享" as const, qty: hold?.qty ?? 0, sold, available: hold ? hold.remaining : zone.sharedRemaining };
+          }),
+          ...groups.map((group) => {
+            const hold = zone.groupHolds.find((item) => item.groupId === group.id);
+            const names = channels.filter((channel) => group.channelIds.includes(channel.id)).map((channel) => channel.name).join("、");
+            return { key: `g${group.id}`, label: `分组 · ${group.name}${names ? `（${names}）` : ""}`, target: "group" as const, targetId: group.id, mode: hold ? "独立" as const : "共享" as const, qty: hold?.qty ?? 0, sold: hold?.sold ?? soldOf(group.channelIds), available: hold ? hold.remaining : zone.sharedRemaining };
+          }),
+          ...channels.filter((channel) => channel.kind === "分销" && !grouped.has(channel.id)).map((channel) => {
+            const hold = zone.holds.find((item) => item.channelId === channel.id);
+            const sold = soldOf([channel.id]);
+            return { key: `d${channel.id}`, label: `未分组 · ${channel.name}`, target: "channel" as const, targetId: channel.id, mode: hold ? "独立" as const : "共享" as const, qty: hold?.qty ?? 0, sold, available: hold ? hold.remaining : zone.sharedRemaining };
+          }),
+        ];
+        return (
+          <section className="card" key={zone.id}>
+            <h2><i className="swatch" style={{ background: zone.color }} /> {zone.name}</h2>
+            <p className="hint">{zone.templateName ? `已套用默认模板「${zone.templateName}」。` : "这场次创建时没有默认模板。"} 在这里调整只影响本场。</p>
+            <AllocationPanel
+              scope="session"
+              sessionId={session.id}
+              zoneId={zone.id}
+              capacity={zone.capacity}
+              unsellable={zone.unsellable}
+              reserved={zone.reserved}
+              exclusive={zone.holds.reduce((sum, hold) => sum + hold.qty, 0) + zone.groupHolds.reduce((sum, hold) => sum + hold.qty, 0)}
+              shared={zone.sharedPool}
+              sharedRemaining={zone.sharedRemaining}
+              rows={rows}
+              venue={{ display_mode: session.display_mode, fuzzy_ample: session.fuzzy_ample, fuzzy_tight: session.fuzzy_tight }}
+              editable={editable}
+            />
+          </section>
+        );
+      })}
+      <section className="card">
+        <h2>操作记录</h2>
+        {listLogs("分销库存", String(session.id)).map((item) => <p key={item.id}><b>{item.actor}</b> <span className="note">{item.created_at}</span> {item.summary}</p>)}
+        {listLogs("分销库存", String(session.id)).length === 0 ? <p className="hint">本场还没有库存调整记录。新建时已按默认模板写入。</p> : null}
+      </section>
     </div>
   );
 }

@@ -43,6 +43,62 @@ export function listUsers() {
   );
 }
 
+export function listGroups() {
+  const groups = qall<{ id: number; name: string }>("SELECT id, name FROM dist_groups ORDER BY id");
+  const members = qall<{ group_id: number; channel_id: number }>("SELECT group_id, channel_id FROM dist_group_channels");
+  return groups.map((group) => ({
+    ...group,
+    channelIds: members.filter((member) => member.group_id === group.id).map((member) => member.channel_id),
+  }));
+}
+
+export function listTemplates(venueId?: number, zoneId?: number) {
+  const clauses = ["1 = 1"];
+  const params: number[] = [];
+  if (venueId) {
+    clauses.push("t.venue_id = ?");
+    params.push(venueId);
+  }
+  if (zoneId) {
+    clauses.push("t.zone_id = ?");
+    params.push(zoneId);
+  }
+  return qall<{
+    id: number;
+    venue_id: number;
+    zone_id: number;
+    name: string;
+    is_default: number;
+    reserved: number;
+    venue_name: string;
+    zone_name: string;
+    zone_color: string;
+  }>(
+    `SELECT t.*, v.name AS venue_name, z.name AS zone_name, z.color AS zone_color
+     FROM inventory_templates t
+     JOIN venues v ON v.id = t.venue_id
+     JOIN zones z ON z.id = t.zone_id
+     WHERE ${clauses.join(" AND ")}
+     ORDER BY v.id, z.sort_order, t.id`,
+    ...params,
+  );
+}
+
+export function templateHolds(templateId: number) {
+  return {
+    channels: qall<{ channel_id: number; qty: number }>("SELECT channel_id, qty FROM template_channel_holds WHERE template_id = ?", templateId),
+    groups: qall<{ group_id: number; qty: number }>("SELECT group_id, qty FROM template_group_holds WHERE template_id = ?", templateId),
+  };
+}
+
+export function listLogs(area: string, target: string) {
+  return qall<{ id: number; actor: string; summary: string; created_at: string }>(
+    "SELECT id, actor, summary, created_at FROM operation_logs WHERE area = ? AND target = ? ORDER BY id DESC LIMIT 30",
+    area,
+    target,
+  );
+}
+
 export function listChannels() {
   return qall<{ id: number; name: string; kind: string; distributor_id: number | null }>(
     "SELECT * FROM channels ORDER BY id",
@@ -108,8 +164,8 @@ export function getVenue(id: number) {
      WHERE h.venue_id = ?`,
     id,
   );
-  const seats = qall<{ id: number; zone_id: number; row_no: number; col_no: number; row_label: string; seat_no: number; sellable: number }>(
-    "SELECT id, zone_id, row_no, col_no, row_label, seat_no, sellable FROM seats WHERE venue_id = ? ORDER BY row_no, col_no",
+  const seats = qall<{ id: number; zone_id: number | null; row_no: number; col_no: number; row_label: string; seat_no: number; sellable: number; kind: string }>(
+    "SELECT id, zone_id, row_no, col_no, row_label, seat_no, sellable, kind FROM seats WHERE venue_id = ? ORDER BY row_no, col_no",
     id,
   );
   return { ...venue, zones, holds, seats };
@@ -360,8 +416,8 @@ export function listSessions(venueId: number, from: string, to: string) {
 
 function zoneCapacity(zoneId: number) {
   const row = qget<{ sellable: number; unsellable: number }>(
-    `SELECT SUM(CASE WHEN sellable = 1 THEN 1 ELSE 0 END) AS sellable,
-            SUM(CASE WHEN sellable = 0 THEN 1 ELSE 0 END) AS unsellable
+    `SELECT SUM(CASE WHEN kind = 'seat' AND sellable = 1 THEN 1 ELSE 0 END) AS sellable,
+            SUM(CASE WHEN kind = 'seat' AND sellable = 0 THEN 1 ELSE 0 END) AS unsellable
      FROM seats WHERE zone_id = ?`,
     zoneId,
   );
@@ -380,11 +436,20 @@ export function zoneStocksForSession(sessionId: number, venueId: number) {
     "SELECT id, name, color FROM zones WHERE venue_id = ? ORDER BY sort_order, id",
     venueId,
   );
-  const reservedRows = qall<{ zone_id: number; reserved: number }>("SELECT zone_id, reserved FROM session_zones WHERE session_id = ?", sessionId);
+  const reservedRows = qall<{ zone_id: number; reserved: number; template_name: string }>(
+    "SELECT zone_id, reserved, template_name FROM session_zones WHERE session_id = ?",
+    sessionId,
+  );
   const holdRows = qall<{ zone_id: number; channel_id: number; qty: number }>(
     "SELECT zone_id, channel_id, qty FROM session_holds WHERE session_id = ?",
     sessionId,
   );
+  const groupRows = qall<{ zone_id: number; group_id: number; qty: number; name: string }>(
+    `SELECT h.zone_id, h.group_id, h.qty, g.name
+     FROM session_group_holds h JOIN dist_groups g ON g.id = h.group_id WHERE h.session_id = ?`,
+    sessionId,
+  );
+  const members = qall<{ group_id: number; channel_id: number }>("SELECT group_id, channel_id FROM dist_group_channels");
   const orders = sessionOrders(sessionId);
   return zones.map((zone) => {
     const cap = zoneCapacity(zone.id);
@@ -394,9 +459,21 @@ export function zoneStocksForSession(sessionId: number, venueId: number) {
       unsellable: cap.unsellable,
       reserved: reservedRows.find((row) => row.zone_id === zone.id)?.reserved ?? 0,
       holds: holdRows.filter((row) => row.zone_id === zone.id).map((row) => ({ channelId: row.channel_id, qty: row.qty })),
+      groupHolds: groupRows
+        .filter((row) => row.zone_id === zone.id)
+        .map((row) => ({
+          groupId: row.group_id,
+          channelIds: members.filter((member) => member.group_id === row.group_id).map((member) => member.channel_id),
+          qty: row.qty,
+        })),
       orders,
     });
-    return { ...zone, ...stock };
+    return {
+      ...zone,
+      ...stock,
+      templateName: reservedRows.find((row) => row.zone_id === zone.id)?.template_name ?? "",
+      groupNames: Object.fromEntries(groupRows.filter((row) => row.zone_id === zone.id).map((row) => [row.group_id, row.name])),
+    };
   });
 }
 
